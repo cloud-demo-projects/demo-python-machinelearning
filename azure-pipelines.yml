@@ -13,22 +13,442 @@ stages:
 - stage:
   displayName: Dev
   jobs:
-    - job:
-      displayName: Development
-      steps:
-        - checkout: self
-          clean: true
+  - job:
+    displayName: "Automatic testing of pipeline security"
+    pool:
+      name: "$(windowsAgentPoolName)" # must be windows for CredentialScanner
+    steps:
+    - checkout: none
 
-        - task: AzureCLI@1
-          displayName: "Deploy - Infra"
-          name: "Create_Infra"
-          inputs:
-            azureSubscription: $(serviceConnectionName)
-            scriptLocation: "inlineScript"
-            inlineScript: |
-              az deployment group create \
-              --name core-deployment \
-              --resource-group $(resourceGroupName) \
-              --template-file "$(System.DefaultWorkingDirectory)/templates/main.bicep" \
-              --parameters "$(System.DefaultWorkingDirectory)/parameters/infra.dev.json" \
-              --verbose
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-credscan.CredScan@2
+    
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-postanalysis.PostAnalysis@1
+      inputs:
+        CredScan: true
+        ToolLogsNotFoundAction: 'Error'
+  
+  - deployment: DeployAML
+    displayName: "Create RG, AML and associated resources"
+    pool:
+      name: "$(linuxAgentPoolName)"
+    environment: "${{ parameters.env }}"
+    strategy: 
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+  
+          - task: AzureCLI@1
+            displayName: "Create Resource Group"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az extension remove --name azure-cli-ml
+                az extension remove --name ml
+                az group create --name $(resourceGroupName) --location $(location)
+                
+          - bash: |
+              random_string=$(date | md5sum | head -c 12)
+              random_string+="x#X1"
+              echo "##vso[task.setvariable variable=sqlAdminLoginPassword;issecret=true]$random_string"
+  
+          - task: AzurePowerShell@4
+            displayName: "Get inputs for creating Compute Instances"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              ScriptType: "InlineScript"
+              FailOnStandardError: true
+              azurePowerShellVersion: "LatestVersion"
+              Inline: |
+  
+                $users = Get-AzADGroupMember -GroupDisplayName "${{ parameters.workspaceContributorGroupName }}"
+                $users_clean = @()
+                ForEach ($user in $users) {
+                  echo "User: $($user.DisplayName)"
+                  # echo $user.UserPrincipalName
+                  $user_clean = Get-AzADUser -ObjectId $user.Id | Select-Object -Property UserPrincipalName, Id, Mail
+                  $upn = $user_clean.UserPrincipalName.replace(".","").Split("@")[0].ToLower();
+                  $suffixLength = 1+"$(environment)".Length
+                  $upn = $upn.SubString(0, [System.Math]::Min(20-$suffixLength, $upn.Length));
+                  $upn = $upn + "-$(environment)"
+                  $user_clean.UserPrincipalName = $upn
+                  $users_clean += $user_clean
+                }
+                $usersString = $users_clean | ConvertTo-Json -AsArray -Compress
+                echo "##vso[task.setvariable variable=computeInstanceUsers;]$usersString"
+     
+          - task: AzureCLI@1
+            displayName: "Deploy ARM template for AML and associated resources"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              scriptLocation: inlineScript
+              inlineScript: |
+  
+                # main template deployment to resource group level/scope 
+                az deployment group create \
+                  --name $(resourceGroupName) \
+                  --resource-group $(resourceGroupName) \
+                  --template-file $(Build.SourcesDirectory)/infra_setup/deploymentTemplate.json \
+                  --parameters workspaceName=$(amlWorkspaceName) \
+                    location=$(location) \
+                    storageAccountBehindVNet="true" \
+                    keyVaultBehindVNet="true" \
+                    containerRegistryOption="new" \
+                    containerRegistryBehindVNet="true" \
+                    privateEndpointType="AutoApproval" \
+                    automationAccountName="$(automationAccount)" \
+                    synapseName=$(asaWorkspaceName) \
+                    sqlAdministratorLoginPassword=$(sqlAdminLoginPassword) \
+                    groupEmail="${{ parameters.groupEmail }}" \
+                    logAnalyticsName="$(laWorkspaceName)" \
+                    azdoSubnetId="${{ parameters.azdoSubnetId }}"\
+                    dsvmUsers='$(computeInstanceUsers)' \
+                    coreAccountName="$(coreConnectionAccount)" \
+                    storageAccountcore="$(coreStorageId)" \
+                    coreAccountPrivateEndpointName=$(coreEndpointName)
+  
+          - task: AzureCLI@1
+            displayName: "Set shutdown schedule on all VMs"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              scriptLocation: inlineScript
+              inlineScript: |
+                az vm auto-shutdown --ids $(az vm list --resource-group $(resourceGroupName) --query [].id -o tsv) --time 1900
+                    
+          - task: AzurePowerShell@4
+            displayName: "Get outputs from ARM template"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              ScriptType: "InlineScript"
+              FailOnStandardError: true
+              azurePowerShellVersion: "LatestVersion"
+              Inline: |
+                $deployment = Get-AzResourceGroupDeployment -ResourceGroupName "$(resourceGroupName)" -Name "$(resourceGroupName)"
+                echo "##vso[task.setvariable variable=rgUniqueString;]$($deployment.Outputs.rgUniqueString.value)"
+                echo "##vso[task.setvariable variable=rgWsUniqueString;]$($deployment.Outputs.rgWsUniqueString.value)"
+                echo "##vso[task.setvariable variable=vnetName;]$($deployment.Outputs.vnetNameOutput.value)"
+                echo "##vso[task.setvariable variable=subnetName;]$($deployment.Outputs.subnetNameOutput.value)"
+                echo "##vso[task.setvariable variable=scoringSubnetName;]$($deployment.Outputs.scoringSubnetNameOutput.value)"
+                echo "##vso[task.setvariable variable=defaultStorageName;]$($deployment.Outputs.defaultBlobStorageAccountNameOutput.value)"
+                echo "##vso[task.setvariable variable=adlsName;]$($deployment.Outputs.adlsAccountNameOutput.value)"
+                echo "##vso[task.setvariable variable=defenderStorageName;]$($deployment.Outputs.defenderStorageAccountNameOutput.value)"
+                echo "##vso[task.setvariable variable=tenantId;]$($deployment.Outputs.tenantId.value)"
+                echo "##vso[task.setvariable variable=logAnalyticsWorkspaceId;]$($deployment.Outputs.logAnalyticsWorkspaceIdOutput.value)"
+                echo "##vso[task.setvariable variable=scoringSubnetId;]$($deployment.Outputs.scoringSubnetId.value)"
+                echo "##vso[task.setvariable variable=keyVaultName;]$($deployment.Outputs.kvName.value)"
+  
+          - task: AzureCLI@1
+            displayName: "Create Service Principal and store in keyvault for core"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              scriptLocation: inlineScript
+              inlineScript: |
+  
+                SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+                echo "Create service principal and get password. Scope to the resource group"
+  
+                spappname=$(az ad sp list --display-name "sp-$(appRegistrationcore)" -o tsv)
+                echo "$spappname"
+                
+                if [[ $spappname != "" ]]
+                then
+                  echo "Service Principal already exists"
+                else
+                  echo "Create Service Principal"
+                  spsecret=$(az ad sp create-for-rbac --name "sp-$(appRegistrationcore)" --scopes "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$(resourceGroupName)" --role "Reader" --query password -o tsv)
+                  echo "$spsecret" | cut -c 1-5
+  
+                  echo "Key vault name"
+                  echo "$(keyVaultName)"
+  
+                  echo "Assign Access policies"
+                  appId=$(az ad app list --display-name $(appRegistrationName) --query [].appId -o tsv)
+                  az keyvault set-policy -n "$(keyVaultName)" -g "$(resourceGroupName)" --secret-permissions get set list --spn $appId
+  
+                  echo "set secret"
+                  az keyvault secret set --name "sp-$(appRegistrationcore)" --vault-name "$(keyVaultName)" --value $spsecret               
+                fi
+  
+                echo "Get service principal appid / clientid"
+                spappid=$(az ad sp list --display-name "sp-$(appRegistrationcore)" --query "[0].{id:appId}" -o tsv)
+                echo "$spappid"
+                echo "##vso[task.setvariable variable=coreDatastoreServicePrincipalClientId;]$spappid"
+  
+                echo "Key vault name"
+                echo "$(keyVaultName)"
+  
+                echo "Assign Access policies"
+                appId=$(az ad app list --display-name $(appRegistrationName) --query [].appId -o tsv)
+                az keyvault set-policy -n "$(keyVaultName)" -g "$(resourceGroupName)" --secret-permissions get set list --spn $appId
+  
+                echo "get secret"
+                keyvaultsecret=$(az keyvault secret show --name "sp-$(appRegistrationcore)" --vault-name "$(keyVaultName)" --query value)
+                echo "##vso[task.setvariable variable=coreDatastoreServicePrincipalClientSecret;issecret=true]$keyvaultsecret"
+  
+          - task: AzureCLI@1
+            displayName: "Create core Datastore"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              scriptLocation: inlineScript
+              inlineScript: |
+  
+                # main template deployment to resource group level/scope 
+                az deployment group create \
+                  --name coredatastoredeployment \
+                  --resource-group $(resourceGroupName) \
+                  --template-file $(Build.SourcesDirectory)/infra_setup/datastoreTemplate.json \
+                  --parameters workspaceName=$(amlWorkspaceName) \
+                    coreAccountName="$(coreConnectionAccount)" \
+                    coreServicePrincipalClientId=$(coreDatastoreServicePrincipalClientId) \
+                    coreServicePrincipalClientSecret=$(coreDatastoreServicePrincipalClientSecret) \
+                    environmentName=$(environment)
+  
+          - task: AzurePowerShell@4
+            displayName: "Disable cross tenant replication on storage accounts"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              ScriptType: "InlineScript"
+              FailOnStandardError: true
+              azurePowerShellVersion: "LatestVersion"
+              Inline: |
+                # whilst "allowCrossTenantReplication" is set to false in the ARM template, this doesn't seem to be supported
+                # for now, we also disable cross tenant replication via Azure PowerShell
+                $storageAccounts = Get-AzStorageAccount -ResourceGroupName "$(resourceGroupName)"
+                foreach ($sa in $storageAccounts)
+                {
+                  echo "Disable cross tenant replication for $($sa.StorageAccountName)"
+                  Set-AzStorageAccount -ResourceGroupName "$(resourceGroupName)" -AccountName "$($sa.StorageAccountName)" -AllowCrossTenantReplication $false
+                }
+  
+          - task: AzureCLI@1
+            displayName: "Deploy ARM template for Diagnostic Settings"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              scriptLocation: inlineScript
+              inlineScript: |
+  
+                # another tempalte deployment for activity logging to subscription level/scope
+                az deployment sub create \
+                  --name="CreateDiagnosticSetting" \
+                  --location=$(location) \
+                  --template-file $(Build.SourcesDirectory)/infra_setup/diagnosticSetting.json \
+                  --parameters settingName="activity-log-to-$(laWorkspaceName)" \
+                    workspaceId="$(logAnalyticsWorkspaceId)"
+  
+          - task: AzureCLI@1
+            displayName: "Allow public access to AML workspace"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                mkdir $(Pipeline.Workspace)\azextension -p
+                export AZURE_EXTENSION_DIR="$(Pipeline.Workspace)/azextensions"
+                az extension add --name azure-cli-ml
+  
+                az ml workspace show -g "$(resourceGroupName)" -w "$(amlWorkspaceName)"
+                az ml workspace update --allow-public-access true -g "$(resourceGroupName)" --subscription-id "$(subscription-id)" -w "$(amlWorkspaceName)"
+  
+          - task: AzureCLI@1
+            displayName: "Get Managed Identities object ids"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az extension add --name azure-cli-ml
+                echo "---Get AML managed identity---"
+                echo "##vso[task.setvariable variable=amlmanagedIdentity;]$(az resource show -g "$(resourceGroupName)" -n "$(amlWorkspaceName)" --resource-type "Microsoft.MachineLearningServices/workspaces" --query identity.principalId -o tsv)"
+                echo "---Get synapse managed identity---"
+                echo "##vso[task.setvariable variable=synapseManagedIdentity;]$(az synapse workspace show -g "$(resourceGroupName)" -n "$(asaWorkspaceName)" --query identity.principalId -o tsv)"
+  
+          - task: AzurePowerShell@4
+            displayName: "Get other AD object ids"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              ScriptType: "InlineScript"
+              FailOnStandardError: true
+              azurePowerShellVersion: "LatestVersion"
+              Inline: |
+                $workspaceContributorGroupId = (Get-AzADGroup -DisplayNameStartsWith "${{ parameters.workspaceContributorGroupName }}").Id
+                echo "##vso[task.setvariable variable=workspaceContributorGroupId;]$workspaceContributorGroupId"
+  
+                $amlWorkspaceReaderGroupId = (Get-AzADGroup -DisplayNameStartsWith "${{ parameters.amlWorkspaceReaderGroupName }}").Id
+                echo "##vso[task.setvariable variable=amlWorkspaceReaderGroupId;]$amlWorkspaceReaderGroupId"
+  
+                $sensitiveDataReaderGroupId = (Get-AzADGroup -DisplayNameStartsWith "${{ parameters.sensitiveDataReaderGroupName }}").Id
+                echo "##vso[task.setvariable variable=sensitiveDataReaderGroupId;]$sensitiveDataReaderGroupId"
+  
+                $dataContributorGroupId = (Get-AzADGroup -DisplayNameStartsWith "${{ parameters.dataContributorGroupName }}").Id
+                echo "##vso[task.setvariable variable=dataContributorGroupId;]$dataContributorGroupId"
+  
+                # this group isn't currently used...
+                $dataReaderGroupId = (Get-AzADGroup -DisplayNameStartsWith "${{ parameters.dataReaderGroupName }}").Id
+                echo "##vso[task.setvariable variable=dataReaderGroupId;]$dataReaderGroupId"
+  
+                $linkedServiceId = (Get-AzADServicePrincipal -DisplayNameBeginsWith "$(amlWorkspaceName)/linkedServices/amlSynapseLink").Id
+                echo "##vso[task.setvariable variable=linkedServiceId;]$linkedServiceId"
+  
+          - task: AzurePowerShell@4
+            displayName: "Grant access to other resources"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              ScriptType: "InlineScript"
+              FailOnStandardError: true
+              azurePowerShellVersion: "LatestVersion"
+              Inline: |
+                $subscriptionId = (Get-AzContext).Subscription.id
+  
+                function Set-RoleAssignment {
+                  param (
+                    [string]$Identity,
+                    [string]$RoleDefinitionName,
+                    [string]$Scope
+                  )
+                  $RoleAssignment = Get-AzRoleAssignment `
+                    -ObjectId "$Identity" `
+                    -RoleDefinitionName "$RoleDefinitionName"`
+                    -Scope  "/subscriptions/$subscriptionId/resourcegroups/$(resourceGroupName)$Scope"
+                  if (!$RoleAssignment)
+                  {
+                    Write-Host "Add role assignment to storage container"
+                    New-AzRoleAssignment `
+                      -ObjectId "$Identity" `
+                      -RoleDefinitionName "$RoleDefinitionName"`
+                      -Scope  "/subscriptions/$subscriptionId/resourcegroups/$(resourceGroupName)$Scope"
+                  }          
+                }
+  
+                $storageAccounts = Get-AzStorageAccount -ResourceGroupName "$(resourceGroupName)"
+                foreach ($sa in $storageAccounts)
+                {
+                  echo "Permissions for $($sa.StorageAccountName) to:"
+                  # Gives read access to all data stores for the AML workspace
+                  echo "...Azure ML Managed Identity: $(amlmanagedIdentity)"
+                  Set-RoleAssignment -Identity "$(amlmanagedIdentity)" -RoleDefinitionName "Reader"                   -Scope "/providers/Microsoft.Storage/storageAccounts/$($sa.StorageAccountName)"
+                  Set-RoleAssignment -Identity "$(amlmanagedIdentity)" -RoleDefinitionName "Storage Blob Data Reader" -Scope "/providers/Microsoft.Storage/storageAccounts/$($sa.StorageAccountName)"
+                  
+                  # Gives read access to all data stores for the Synapse workspace
+                  echo "...Synapse Managed Identity: $(synapseManagedIdentity)"
+                  Set-RoleAssignment -Identity "$(synapseManagedIdentity)" -RoleDefinitionName "Reader"                        -Scope "/providers/Microsoft.Storage/storageAccounts/$($sa.StorageAccountName)"
+                  Set-RoleAssignment -Identity "$(synapseManagedIdentity)" -RoleDefinitionName "Storage Blob Data Reader"      -Scope "/providers/Microsoft.Storage/storageAccounts/$($sa.StorageAccountName)"
+                  Set-RoleAssignment -Identity "$(synapseManagedIdentity)" -RoleDefinitionName "Storage Blob Data Contributor" -Scope "/providers/Microsoft.Storage/storageAccounts/$($sa.StorageAccountName)"
+                  
+                  # Gives read access to all data stores for the AML Synapse Linked Service
+                  echo "...Synapse Managed Identity: $(linkedServiceId)"
+                  Set-RoleAssignment -Identity "$(linkedServiceId)" -RoleDefinitionName "Reader"                        -Scope "/providers/Microsoft.Storage/storageAccounts/$($sa.StorageAccountName)"
+                  Set-RoleAssignment -Identity "$(linkedServiceId)" -RoleDefinitionName "Storage Blob Data Reader"      -Scope "/providers/Microsoft.Storage/storageAccounts/$($sa.StorageAccountName)"
+                  Set-RoleAssignment -Identity "$(linkedServiceId)" -RoleDefinitionName "Storage Blob Data Contributor" -Scope "/providers/Microsoft.Storage/storageAccounts/$($sa.StorageAccountName)"
+  
+                  # Gives read, & list keys, access to all data stores to relevant team members
+                  echo "...Data Readers: ${{ parameters.sensitiveDataReaderGroupName }}"
+                  Set-RoleAssignment -Identity "$(sensitiveDataReaderGroupId)" -RoleDefinitionName "Storage Blob Data Reader" -Scope "/providers/Microsoft.Storage/storageAccounts/$($sa.StorageAccountName)"
+                  Set-RoleAssignment -Identity "$(sensitiveDataReaderGroupId)" -RoleDefinitionName "Reader and Data Access"   -Scope "/providers/Microsoft.Storage/storageAccounts/$($sa.StorageAccountName)"
+                }
+  
+                # Add other permissions/access
+                echo "Remaining permissions..."
+                Set-RoleAssignment -Identity "$(workspaceContributorGroupId)"    -RoleDefinitionName "Reader"                        -Scope ""
+                Set-RoleAssignment -Identity "$(workspaceContributorGroupId)"    -RoleDefinitionName "Rabobank Data scientist"       -Scope "/providers/Microsoft.MachineLearningServices/workspaces/$(amlWorkspaceName)"
+                Set-RoleAssignment -Identity "$(dataContributorGroupId)"         -RoleDefinitionName "Storage Blob Data Contributor" -Scope "/providers/Microsoft.Storage/storageAccounts/$(adlsName)"
+                Set-RoleAssignment -Identity "$(amlWorkspaceReaderGroupId)"      -RoleDefinitionName "Reader"                        -Scope "/providers/Microsoft.MachineLearningServices/workspaces/$(amlWorkspaceName)"
+  
+          - task: AzureCLI@1
+            displayName: "Sync keys for blob datastore"
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az extension add --name azure-cli-ml
+                az ml workspace sync-keys -w "$(amlWorkspaceName)" -g "$(resourceGroupName)"
+            
+          - task: AzureCLI@1
+            displayName: "AKS deploy"
+            condition: eq('${{ parameters.deployAKS }}', 'true')
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                # 0. Scripts based on following documentation
+                #
+                # https://docs.microsoft.com/en-us/azure/machine-learning/how-to-deploy-managed-online-endpoints
+                # https://docs.microsoft.com/en-us/azure/machine-learning/how-to-attach-arc-kubernetes?tabs=studio#azure-kubernetes-service-aks-
+                # MS support script links:
+                # https://github.com/csiebler/azureml-online-endpoints-aks
+                # https://github.com/rebremer/blog-mlopsapim-git/blob/master/other/mlv2clitest/cli_script_amlpe.txt
+                # 1. Install extensions
+                #
+                az extension remove --name azure-cli-ml
+                az extension add --name ml
+                az extension add --name connectedk8s
+                az extension add --name k8s-extension --version 1.2.3
+  
+                # 2. variables
+                #
+                aksclustername="akscluster" # if you change it here, change it in the endpoint.yml as well
+                # TODO: Remove hard-coded variables
+                dns_service_ip='10.100.0.10'
+                aks_subnet_cidr_address_range='10.100.0.0/24'
+                # 4. Create external AKS cluster
+                #
+                # https://docs.microsoft.com/en-us/azure/aks/configure-azure-cni
+                az aks create --resource-group "$(resourceGroupName)" --name $aksclustername --network-plugin azure --vnet-subnet-id "$(scoringSubnetId)" --docker-bridge-address 172.17.0.1/16 --dns-service-ip $dns_service_ip --service-cidr $aks_subnet_cidr_address_range --generate-ssh-keys --enable-managed-identity --node-vm-size Standard_D3_v2 -y
+                az aks install-cli
+                az aks get-credentials --resource-group "$(resourceGroupName)" --name $aksclustername --overwrite-existing
+                az aks list
+                kubectl create namespace aks-compute
+                kubectl get namespaces
+                
+                # 5. Assign role
+                aks_object_id=`az aks show -g "$(resourceGroupName)" -n $aksclustername --query 'identity.principalId' | sed 's/\"//g'`
+                vnet_id=`az network vnet show -g "$(resourceGroupName)" -n "$(vnetName)" --query 'id' | sed 's/\"//g'`
+                az role assignment create --assignee-object-id $aks_object_id --role "Network Contributor" --scope $vnet_id
+  
+                # 7. Install Azure ML extension on AKS cluster
+                #
+                az feature register --namespace Microsoft.ContainerService -n AKS-ExtensionManager
+                az k8s-extension create --name arcml-inference --extension-type Microsoft.AzureML.Kubernetes --config internalLoadBalancerProvider=azure enableTraining=False enableInference=True inferenceRouterServiceType=LoadBalancer allowInsecureConnections=True inferenceLoadBalancerHA=False --cluster-type managedClusters --cluster-name $aksclustername --resource-group "$(resourceGroupName)" --scope cluster --auto-upgrade-minor-version true
+                az k8s-extension show --name arcml-inference --cluster-type managedClusters --cluster-name $aksclustername --resource-group "$(resourceGroupName)"
+  
+          - task: AzureCLI@1
+            displayName: Attach AKS to AML
+            condition: eq('${{ parameters.deployAKS }}', 'true')
+            name: AKSattach
+            enabled: true
+            inputs:
+              azureSubscription: $(azureServiceConnectionName)
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az extension remove --name azure-cli-ml
+                az extension add --name ml
+                az extension add --name connectedk8s
+                az extension add --name k8s-extension --version 1.2.3
+  
+                nAksExtensions=$(az k8s-extension list --cluster-name akscluster --cluster-type managedClusters -g "$(resourceGroupName)" --query "[] | length(@)")
+                echo nAksExtensions
+                
+                if [[ $nAksExtensions -eq 1 ]]
+                then
+                  # 8. Attach AKS cluster to AML workspace
+                  #
+                  # get your resource id of you aks cluster
+                  echo "Found 1 aks extension, proceeding to attach"
+                  aks_id=`az aks show -g "$(resourceGroupName)" -n akscluster --query 'id' | sed 's/\"//g'`
+                  az ml compute attach -g "$(resourceGroupName)" -w "$(amlWorkspaceName)" -n akscluster -t Kubernetes --resource-id $aks_id --namespace "aks-compute"
+                else
+                  echo "Could not find aks extensions"
+                fi
