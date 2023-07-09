@@ -1,4 +1,4 @@
-# demo-python-machinelearning
+# Demo-Python-MachineLearning
 
 ## References
 - [MLOps-python](https://learn.microsoft.com/en-us/azure/architecture/reference-architectures/ai/mlops-python)
