@@ -1,19 +1,34 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+name: core-infra
 
 trigger:
-- main
+  - none
 
 pool:
   vmImage: ubuntu-latest
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+variables:
+- template: variables/dev.yml
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+stages:
+- stage:
+  displayName: Dev
+  jobs:
+    - job:
+      displayName: Development
+      steps:
+        - checkout: self
+          clean: true
+
+        - task: AzureCLI@1
+          displayName: "Deploy - Infra"
+          name: "Create_Infra"
+          inputs:
+            azureSubscription: $(serviceConnectionName)
+            scriptLocation: "inlineScript"
+            inlineScript: |
+              az deployment group create \
+              --name core-deployment \
+              --resource-group $(resourceGroupName) \
+              --template-file "$(System.DefaultWorkingDirectory)/templates/main.bicep" \
+              --parameters "$(System.DefaultWorkingDirectory)/parameters/infra.dev.json" \
+              --verbose
