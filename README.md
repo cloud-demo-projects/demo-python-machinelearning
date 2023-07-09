@@ -1,5 +1,12 @@
 # demo-python-machinelearning
 
+## References
+- [MLOps-python](https://learn.microsoft.com/en-us/azure/architecture/reference-architectures/ai/mlops-python)
+- [MLOpsPython Getting Started](https://github.com/microsoft/MLOpsPython/blob/master/docs/getting_started.md)
+- [MLOpsPython](https://github.com/Microsoft/MLOpsPython)
+- [MLOps](https://github.com/microsoft/MLOps)
+
+
 ## Usecase
 Machine learning classification algorithms can be used for predicting and diagnosing diabetes based on various input features. Here's a step-by-step guide on how to approach diabetes classification using machine learning:
 
