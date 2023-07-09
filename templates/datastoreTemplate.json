@@ -1,0 +1,80 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": { 
+    "workspaceName": {
+      "type": "string",
+      "metadata": {
+        "description": "Specifies the name of the Azure Machine Learning workspace."
+      }
+    },
+    "environmentName": {
+      "type": "string",
+      "metadata": {
+        "description": "Specifies the name of the deployment environment."
+      }
+    },
+    "coreDatastoreContainers": {
+      "type": "object",
+      "metadata": {
+        "description": "Name of the core container"
+      },
+      "defaultValue": {
+        "dev": ["ycds"],
+	      "prd": ["google-analytics-productlevel","usabilla","siebel-idaa-cdf","servicemanager"]
+	    }
+    },
+    "coreAccountName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the core account name"
+      }
+    },
+    "coreServicePrincipalClientId": {
+      "type": "String",
+      "metadata": {
+        "description": "Specifies the SP for core."
+      }
+    },
+    "coreServicePrincipalClientSecret": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Specifies the secret for SP."
+      }
+    }
+  },
+  "variables": {
+    "tenantId": "[subscription().tenantId]",
+    "list": "[parameters('coreDatastoreContainers')[parameters('environmentName')]]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.MachineLearningServices/workspaces/datastores",
+      "apiVersion": "2022-05-01",
+      "name": "[concat(parameters('workspaceName'), '/', replace(variables('list')[copyIndex()], '-','_'))]",
+      "copy": {
+        "name": "containercopyloop",
+        "count": "[length(variables('list'))]"
+      },
+      "properties": {
+        "credentials": {
+        "credentialsType": "ServicePrincipal",
+        "authorityUrl": "https://login.microsoftonline.com",
+        "resourceUrl": "https://storage.azure.com/",
+        "tenantId": "[variables('tenantId')]",
+        "clientId": "[parameters('coreServicePrincipalClientId')]",
+        "secrets": {
+          "clientSecret": "[parameters('coreServicePrincipalClientSecret')]",
+          "secretsType": "String"
+          }
+        },
+        "datastoreType": "AzureDataLakeGen2",
+        "accountName": "[parameters('coreaccountName')]",
+        "filesystem": "[variables('list')[copyIndex()]]",
+        "endpoint": "core.windows.net",
+        "protocol": "https",
+        "serviceDataAccessAuthIdentity": "None"
+      } 
+    }
+  ]
+}
