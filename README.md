@@ -5,6 +5,7 @@
 - [MLOpsPython Getting Started](https://github.com/microsoft/MLOpsPython/blob/master/docs/getting_started.md)
 - [MLOpsPython](https://github.com/Microsoft/MLOpsPython)
 - [MLOps](https://github.com/microsoft/MLOps)
+- [CI/CD](https://learn.microsoft.com/en-us/azure/machine-learning/how-to-devops-machine-learning?view=azureml-api-2&tabs=arm)
 
 
 ## Usecase
